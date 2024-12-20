@@ -244,15 +244,14 @@ def merge_layers(derivatives, grain_shapes, similarity_percent):
         med = chunk.median() # average all measured values (use median like for the force)...
         med.distance = top # ... except for the distance, which will now represent "top of layer"
         merged = pd.concat([merged, med.to_frame().T], ignore_index=True) # rebuild single data frame
-    bottom = chunks[-1].iloc[-1].distance # throw away chunks but remember the full profile depth
-    return merged, shapes, bottom
+    derivatives.profile_bottom = chunks[-1].iloc[-1].distance # throw away chunks but remember the full profile depth
+    return merged, shapes
 
-def discard_thin_layers(derivatives, grain_shapes, profile_bottom, min_thickness):
+def discard_thin_layers(derivatives, grain_shapes, min_thickness):
     """Exclude layers below a certain thickness.
 
     param derivatives: Pandas dataframe with derived SMP quantities.
     param grain_shapes: List of grain shapes (one entry per SMP data row).
-    param profile_bottom: Depth of last SMP measurement (which may now me merged into some layer).
     param min_thickness: Minimal allowed thickness of the layer.
     returns:
       - Pandas dataframe with the derivatives excluding thin layers.
@@ -263,17 +262,17 @@ def discard_thin_layers(derivatives, grain_shapes, profile_bottom, min_thickness
     update_bottom = False # can only become True in last iteration
     for idx, row in derivatives.iterrows():
         if idx == len(derivatives) - 1: # last layer
-            thickness = profile_bottom - row.distance
+            thickness = derivatives.profile_bottom - row.distance
             update_bottom = True # if the layer is removed we will move the bottom
         else:
             thickness = derivatives['distance'][idx + 1] - row.distance
         if thickness < min_thickness:
             drop_indices.append(idx)
             if update_bottom:
-                profile_bottom = row.distance # it was the last layer
+                derivatives.profile_bottom = row.distance # it was the last layer
     derivatives.drop(drop_indices, inplace=True)
     derivatives.reset_index(inplace=True)
-    return derivatives, grain_shapes, profile_bottom
+    return derivatives, grain_shapes
 
 def preprocess_lowlevel(derivatives, export_settings):
     """Basic signal pre-processing before layer merging. Depending on the export settings
@@ -286,6 +285,10 @@ def preprocess_lowlevel(derivatives, export_settings):
     'noise_threshold' (float) and 'smoothing' (bool).
     returns: Pandas dataframe with the pre-processed derivatives.
     """
+    if hasattr(derivatives, 'profile_bottom'):
+        pass
+    else:
+        derivatives.profile_bottom = derivatives.iloc[-1].distance # if nothing is merged/removed this will be the bottom
     if export_settings.get('remove_negative_data', False):
         derivatives = remove_negatives(derivatives)
     if export_settings.get('remove_noise', False) and export_settings['noise_threshold']:
@@ -308,14 +311,16 @@ def preprocess_layers(derivatives, grain_shapes, export_settings):
       - List of grain shapes associated with each layer.
       - Depth at the end of the profile (bottom layers may have been merged/removed).
     """
-    profile_bottom = derivatives.iloc[-1].distance # if nothing is merged/removed this will be the bottom
+    if hasattr(derivatives, 'profile_bottom'):
+        pass
+    else:
+        derivatives.profile_bottom = derivatives.iloc[-1].distance # if nothing is merged/removed this will be the bottom
     if export_settings.get('merge_layers', False):
         sim_percent = float(export_settings.get('similarity_percent', 500))
-        derivatives, shapes, profile_bottom = merge_layers(derivatives, grain_shapes, sim_percent)
+        derivatives, shapes = merge_layers(derivatives, grain_shapes, sim_percent)
     if export_settings.get('discard_thin_layers', False) and export_settings['discard_layer_thickness']:
-        derivatives, grain_shapes, profile_bottom = discard_thin_layers(derivatives, grain_shapes,
-            profile_bottom, float(export_settings['discard_layer_thickness']))
-    return derivatives, grain_shapes, profile_bottom
+        derivatives, grain_shapes = discard_thin_layers(derivatives, grain_shapes, float(export_settings['discard_layer_thickness']))
+    return derivatives, grain_shapes
 
 def export(settings, derivatives, grain_shapes, prof_id, timestamp, smp_serial,
     longitude, latitude, altitude, outfile):
@@ -349,7 +354,7 @@ def export(settings, derivatives, grain_shapes, prof_id, timestamp, smp_serial,
     # one with only basic pre-processing for the embedded density, SSA and hardness profiles
     # (because we don't want only 1 data point per thick layer for the embedded profiles):
     derivatives = preprocess_lowlevel(derivatives, settings)
-    layer_derivatives, grain_shapes, profile_bottom = preprocess_layers(derivatives,
+    layer_derivatives, grain_shapes = preprocess_layers(derivatives,
         grain_shapes, settings)
 
     # Meta data:
@@ -422,7 +427,7 @@ def export(settings, derivatives, grain_shapes, prof_id, timestamp, smp_serial,
         thickness = ET.SubElement(layer, f'{_ns_caaml}:thickness')
         thickness.set('uom', 'cm')
         if idx == len(layer_derivatives) - 1:
-            layer_thickness = profile_bottom - row.distance
+            layer_thickness = layer_derivatives.profile_bottom - row.distance
         else:
             layer_thickness = layer_derivatives.distance[idx + 1] - row.distance
         thickness.text = str(mm2cm(layer_thickness))
@@ -433,7 +438,7 @@ def export(settings, derivatives, grain_shapes, prof_id, timestamp, smp_serial,
         grain_size.set('uom', 'mm')
         grain_components = ET.SubElement(grain_size, f'{_ns_caaml}:Components')
         grain_sz_avg = ET.SubElement(grain_components, f'{_ns_caaml}:avg')
-        grain_sz_avg.text = str(m2mm(optical_thickness(row[f'{parameterization}_ssa'])))
+        grain_sz_avg.text = str(round(m2mm(optical_thickness(row[f'{parameterization}_ssa'])),2))
         grain_hardness = ET.SubElement(layer, f'{_ns_caaml}:hardness')
         grain_hardness.set('uom', '')
         grain_hardness.text = hand_hardness_label(row['force_median'])
@@ -444,33 +449,45 @@ def export(settings, derivatives, grain_shapes, prof_id, timestamp, smp_serial,
     dens_meth = ET.SubElement(dens_meta, f'{_ns_caaml}:methodOfMeas')
     dens_meth.text = "other"
 
-    for _, row in derivatives.iterrows():
+    for idx, row in derivatives.iterrows():
         layer = ET.SubElement(dens_prof, f'{_ns_caaml}:Layer')
         depth_top = ET.SubElement(layer, f'{_ns_caaml}:depthTop')
         depth_top.set('uom', 'cm')
         depth_top.text = str(mm2cm(row['distance']))
+        thickness = ET.SubElement(layer, f'{_ns_caaml}:thickness')
+        thickness.set('uom', 'cm')
+        if idx == len(derivatives) - 1:
+            layer_thickness = derivatives.profile_bottom - row.distance
+        else:
+            layer_thickness = derivatives.distance[idx + 1] - row.distance
+        thickness.text = str(mm2cm(layer_thickness))
         density = ET.SubElement(layer, f'{_ns_caaml}:density')
         density.set('uom', 'kgm-3')
         density_val = row[f'{parameterization}_density']
-        density.text = str(density_val)
+        density.text = str(round(density_val,2))
 
     # Specific surface area profile:
     ssa_prof = ET.SubElement(snow_prof_meas, f'{_ns_caaml}:specSurfAreaProfile')
     ssa_meta = ET.SubElement(ssa_prof, f'{_ns_caaml}:specSurfAreaMetaData')
     ssa_meth = ET.SubElement(ssa_meta, f'{_ns_caaml}:methodOfMeas')
     ssa_meth.text = "other"
-    ssa_comp = ET.SubElement(ssa_prof, f'{_ns_caaml}:MeasurementComponents')
-    ssa_comp.set('uomDepth', 'cm')
-    ssa_comp.set('uomSpecSurfArea', 'm2kg-1')
-    ssa_depth = ET.SubElement(ssa_comp, f'{_ns_caaml}:depth')
-    ssa_res = ET.SubElement(ssa_comp, f'{_ns_caaml}:specSurfArea')
-    ssa_meas = ET.SubElement(ssa_prof, f'{_ns_caaml}:Measurements')
-    ssa_tuple = ET.SubElement(ssa_meas, f'{_ns_caaml}:tupleList')
 
-    tuple_list = ''
-    for _, row in derivatives.iterrows():
-        tuple_list = tuple_list + str(mm2cm(row['distance'])) + "," + str(row[f'{parameterization}_ssa']) + " "
-    ssa_tuple.text = tuple_list
+    for idx, row in derivatives.iterrows():
+        layer = ET.SubElement(ssa_prof, f'{_ns_caaml}:Layer')
+        depth_top = ET.SubElement(layer, f'{_ns_caaml}:depthTop')
+        depth_top.set('uom', 'cm')
+        depth_top.text = str(mm2cm(row['distance']))
+        thickness = ET.SubElement(layer, f'{_ns_caaml}:thickness')
+        thickness.set('uom', 'cm')
+        if idx == len(derivatives) - 1:
+            layer_thickness = derivatives.profile_bottom - row.distance
+        else:
+            layer_thickness = derivatives.distance[idx + 1] - row.distance
+        thickness.text = str(mm2cm(layer_thickness))
+        ssa = ET.SubElement(layer, f'{_ns_caaml}:specSurfArea')
+        ssa.set('uom', 'm2kg-1')
+        ssa_val = row[f'{parameterization}_ssa']
+        ssa.text = str(round(ssa_val,2))
 
     # Hardness profile:
     hard_prof = ET.SubElement(snow_prof_meas, f'{_ns_caaml}:hardnessProfile')
